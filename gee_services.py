@@ -43,6 +43,15 @@ def _get_collection(sensor: str):
 
 thumbnail_to_asset_map = {}  # retained for legacy callers; no longer written to by load_imagery_gee
 
+# Per-index visualisation config: threshold, logical operator, and colour palette.
+# The threshold here is applied to the *difference* image (idx2 - idx1).
+INDEX_VIS_CONFIG = {
+    "NDWI":    {"threshold":  0.1,  "operator": "gt", "palette": ["0000FF"]},  # blue  — water gain
+    "NDVI":    {"threshold":  0.2,  "operator": "gt", "palette": ["00FF00"]},  # green — vegetation gain
+    "NBR":     {"threshold": -0.1,  "operator": "lt", "palette": ["FF0000"]},  # red   — burn scars
+    "DEFAULT": {"threshold":  0.0,  "operator": "gt", "palette": ["FF0000"]},
+}
+
 
 def _sanitized_filename(ext: str = "png") -> str:
     """Return a generic UUID-based filename with no semantic content."""
@@ -142,7 +151,13 @@ def _render_thumbnail(image, sensor: str, asset_id: str = None, region=None):
         except Exception:
             vis_params = {'bands': ['VV'], 'min': -25, 'max': 0}
 
-    thumb_params = {'dimensions': 512, 'format': 'png'}
+    thumb_params = {
+        'dimensions': 512,
+        'format': 'png',
+        'crs': 'EPSG:3857',  # Web Mercator — matches mask thumbnails exactly
+    }
+    # region must be an ee.Geometry so GEE can reproject it into EPSG:3857 correctly.
+    # Callers pass image.geometry().bounds() — a server-side axis-aligned rectangle.
     if region is not None:
         thumb_params['region'] = region
 
@@ -232,9 +247,27 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
         bare_id = image.id().getInfo()
         # ee.Image(bare_id) would fail — GEE requires the full collection-qualified path
         asset_id = f"{collection_path}/{bare_id}" if bare_id and not bare_id.startswith("COPERNICUS/") else bare_id
-        # Clip the image to the AOI so getThumbURL has a bounded region to render
-        clipped = image.clip(aoi)
-        thumbnail_url = _render_thumbnail(clipped, used_sensor, asset_id, region=region_for_thumb)
+
+        # --- Optical thumbnail: identical region + CRS to mask thumbnails ---
+        roi = image.geometry().bounds()  # North-Up axis-aligned bounding box
+
+        if used_sensor == "Sentinel-2":
+            # Mask out NoData (black fill) pixels so background is transparent
+            img_transparent = image.updateMask(image.select('B4').gt(0))
+            thumbnail_url = img_transparent.getThumbURL({
+                'bands': ['B4', 'B3', 'B2'],
+                'min': 0,
+                'max': 3000,
+                'dimensions': 512,
+                'format': 'png',
+                'region': roi,        # locks scale to exact tile footprint
+                'crs': 'EPSG:3857',   # Web Mercator — matches mask projection
+            })
+        else:
+            # Sentinel-1: compute dynamic stretch then render
+            thumbnail_url = _render_thumbnail(image.clip(aoi), used_sensor, asset_id, region=roi)
+
+        _validate_thumb_url(thumbnail_url, asset_id)
         metadata = _extract_image_metadata(image, used_sensor, region=region_for_thumb)
         images.append({
             "asset_id": asset_id,
@@ -331,7 +364,6 @@ def compute_mask_gee(
 
         # --- Server-side min/max reducer (runs before visualisation) ---
         img1_region = img1.geometry().bounds().getInfo()["coordinates"]
-        region_for_mask = {"type": "Polygon", "coordinates": img1_region}
         geom = ee.Geometry.Polygon(img1_region)
 
         band_name = diff.bandNames().get(0).getInfo()
@@ -362,15 +394,26 @@ def compute_mask_gee(
             else "MISMATCH"
         )
 
-        # --- Threshold to binary change mask ---
-        if index_type == "NDWI" and not is_sar:
-            change = diff.gt(threshold)
-        else:
-            change = diff.lt(threshold)
+        # --- Dynamic threshold + selfMask visualisation ---
+        config = INDEX_VIS_CONFIG.get(index_type.upper() if index_type else "DEFAULT", INDEX_VIS_CONFIG["DEFAULT"])
 
-        # --- Visualise and export thumbnail ---
-        mask_image = change.clip(img1.geometry()).visualize(palette=["FFFFFF", "FF0000"], min=0, max=1)
-        mask_url = mask_image.getThumbURL({"dimensions": 512, "format": "png", "region": region_for_mask})
+        # Binary image: 1 where the condition is met, 0 elsewhere
+        if config["operator"] == "gt":
+            binary_image = diff.gt(config["threshold"])
+        else:
+            binary_image = diff.lt(config["threshold"])
+
+        # roi matches the optical thumbnail exactly — same .bounds() call, same CRS
+        roi = img1.geometry().bounds()
+        visual_mask = binary_image.selfMask()
+
+        mask_url = visual_mask.getThumbURL({
+            "palette": config["palette"],
+            "dimensions": 512,
+            "format": "png",
+            "region": roi,        # locks scale — matches optical exactly
+            "crs": "EPSG:3857",   # Web Mercator — matches optical exactly
+        })
         _validate_thumb_url(mask_url, f"mask between asset {i} and {i + 1}")
 
         # --- Cloud cover (optical only) ---
@@ -407,7 +450,7 @@ def compute_mask_gee(
         # --- Trend analysis ---
         try:
             area = (
-                change.multiply(ee.Image.pixelArea())
+                binary_image.multiply(ee.Image.pixelArea())
                 .reduceRegion(reducer=ee.Reducer.sum(), geometry=geom, scale=30, maxPixels=1e9)
                 .get("constant")
                 .getInfo()
