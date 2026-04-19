@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+earthengine-api
+supabase
+python-dotenv
+httpx
+geopy

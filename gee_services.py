@@ -1,0 +1,423 @@
+import ee
+import os
+import uuid
+from functools import wraps
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SERVICE_ACCOUNT = os.environ["GEE_SERVICE_ACCOUNT"]
+KEY_FILE = os.environ["GEE_KEY_FILE"]
+
+try:
+    credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_FILE)
+    ee.Initialize(credentials)
+    print("GEE Initialized Successfully!")
+except Exception as e:
+    print(f"Failed to initialize GEE: {str(e)}")
+
+def catch_ee_errors(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ee.EEException as e:
+            return {"status": "error", "message": f"GEE Exception: {str(e)}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Server Error: {str(e)}"}
+    return wrapper
+
+
+def _expand_date_window(start_date: str, end_date: str, days: int):
+    start = datetime.fromisoformat(start_date) - timedelta(days=days)
+    end = datetime.fromisoformat(end_date) + timedelta(days=days)
+    return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+
+
+def _get_collection(sensor: str):
+    if sensor == "Sentinel-2":
+        return ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+    return ee.ImageCollection("COPERNICUS/S1_GRD")
+
+
+thumbnail_to_asset_map = {}  # retained for legacy callers; no longer written to by load_imagery_gee
+
+
+def _sanitized_filename(ext: str = "png") -> str:
+    """Return a generic UUID-based filename with no semantic content."""
+    return f"tmp_{uuid.uuid4().hex[:8]}.{ext}"
+
+
+def _extract_image_metadata(image, sensor: str, region=None) -> dict:
+    """
+    Compute strictly typed metadata for a single GEE image.
+    Returns a dict matching the ImageryMetadata schema.
+    """
+    # --- Timestamp ---
+    ts_ms = image.get("system:time_start").getInfo()
+    if ts_ms:
+        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+    else:
+        ts = datetime.now(tz=timezone.utc).isoformat()
+
+    # --- Cloud cover ---
+    if sensor == "Sentinel-2":
+        cloud_cover = image.get("CLOUDY_PIXEL_PERCENTAGE").getInfo() or 0.0
+    else:
+        cloud_cover = 0.0  # SAR is not affected by cloud cover
+
+    # --- CRS ---
+    try:
+        proj = image.select(0).projection().getInfo()
+        actual_crs = proj.get("crs", "UNKNOWN")
+    except Exception:
+        actual_crs = "UNKNOWN"
+    alignment = (
+        "MATCH"
+        if (
+            actual_crs == "EPSG:4326"
+            or actual_crs.startswith("EPSG:326")   # UTM North zones
+            or actual_crs.startswith("EPSG:327")   # UTM South zones
+        )
+        else "MISMATCH"
+    )
+
+    # --- Index stats (band 0 min/max over region) ---
+    try:
+        geom = ee.Geometry.Polygon(region["coordinates"]) if region else image.geometry()
+        stats = image.select(0).reduceRegion(
+            reducer=ee.Reducer.minMax(),
+            geometry=geom,
+            scale=100,
+            maxPixels=1e9,
+        ).getInfo()
+        band_name = list(stats.keys())[0].rsplit("_", 1)[0] if stats else "b1"
+        idx_min = float(stats.get(f"{band_name}_min") or 0.0)
+        idx_max = float(stats.get(f"{band_name}_max") or 1.0)
+    except Exception:
+        idx_min, idx_max = 0.0, 1.0
+
+    return {
+        "cloud_cover_percent": float(cloud_cover),
+        "crs_info": {
+            "expected": "EPSG:4326 | UTM",
+            "actual": actual_crs,
+            "alignment": alignment,
+        },
+        "index_stats": {"min": idx_min, "max": idx_max},
+        "timestamp": ts,
+    }
+
+
+def _validate_thumb_url(url: str, context: str = "") -> str:
+    """Ensure GEE returned a real https:// URL and not an asset ID or garbage."""
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise ValueError(
+            f"GEE did not return a valid thumbnail URL{' for ' + context if context else ''}. "
+            f"Got: {url!r}. Ensure the image has a valid region and vis params."
+        )
+    return url
+
+
+def _render_thumbnail(image, sensor: str, asset_id: str = None, region=None):
+    if sensor == "Sentinel-2":
+        vis_params = {'bands': ['B4', 'B3', 'B2'], 'min': 0, 'max': 3000}
+    else:
+        # Calculate 1-standard-deviation stretch for Sentinel-1
+        try:
+            geom = ee.Geometry.Polygon(region['coordinates']) if region else image.geometry()
+            stats = image.reduceRegion(
+                reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
+                geometry=geom,
+                scale=100,
+                maxPixels=1e9
+            ).getInfo()
+            if stats and 'VV_mean' in stats and 'VV_stdDev' in stats and stats['VV_stdDev'] is not None:
+                mean = stats['VV_mean']
+                std = stats['VV_stdDev']
+                vis_params = {'bands': ['VV'], 'min': mean - std, 'max': mean + std}
+            else:
+                vis_params = {'bands': ['VV'], 'min': -25, 'max': 0}
+        except Exception:
+            vis_params = {'bands': ['VV'], 'min': -25, 'max': 0}
+
+    thumb_params = {'dimensions': 512, 'format': 'png'}
+    if region is not None:
+        thumb_params['region'] = region
+
+    url = image.visualize(**vis_params).getThumbURL(thumb_params)
+    _validate_thumb_url(url, asset_id or "unknown image")
+    return url
+
+
+def _is_asset_id(value: str):
+    # Covers COPERNICUS/S2_*, COPERNICUS/S1_GRD/*, and user/project assets
+    return isinstance(value, str) and (
+        value.startswith("COPERNICUS/")
+        or value.startswith("projects/")
+        or value.startswith("users/")
+    )
+
+
+def _search_images_with_expansion(aoi, start_date: str, end_date: str, sensor: str):
+    collection = _get_collection(sensor)
+    high_cloud_found = False
+    for delta in [0, 7, 14]:
+        window_start, window_end = _expand_date_window(start_date, end_date, delta)
+        filtered = collection.filterBounds(aoi).filterDate(window_start, window_end)
+        if sensor == "Sentinel-2":
+            low_cloud = filtered.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+            low_count = low_cloud.size().getInfo()
+            if low_count > 0:
+                return low_cloud, sensor, False, (window_start, window_end)
+            if filtered.size().getInfo() > 0:
+                high_cloud_found = True
+        else:
+            count = filtered.size().getInfo()
+            if count > 0:
+                return filtered, sensor, False, (window_start, window_end)
+    return None, sensor, high_cloud_found, None
+
+
+@catch_ee_errors
+def check_availability_gee(aoi_dict: dict, date_range: list, sensor: str):
+    aoi = ee.Geometry.Polygon(aoi_dict["coordinates"])
+    start_date, end_date = date_range[0], date_range[1]
+
+    collection, used_sensor, high_cloud, window = _search_images_with_expansion(aoi, start_date, end_date, sensor)
+    if collection is None and sensor == "Sentinel-2" and high_cloud:
+        collection, used_sensor, _, window = _search_images_with_expansion(aoi, start_date, end_date, "Sentinel-1")
+
+    if collection is None:
+        return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
+
+    count = collection.size().getInfo()
+    if count == 0:
+        return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
+
+    latest_image = ee.Image(collection.sort('system:time_start', False).first())
+    latest_date = ee.Date(latest_image.get('system:time_start')).format('YYYY-MM-dd').getInfo()
+
+    return {"status": "success", "data": {"images_found": count, "latest_pass_date": latest_date}}
+
+
+@catch_ee_errors
+def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
+    aoi = ee.Geometry.Polygon(aoi_dict["coordinates"])
+    start_date, end_date = date_range[0], date_range[1]
+
+    # Get the AOI bounding box as a GeoJSON-compatible region dict for getThumbURL
+    aoi_bounds = aoi.bounds().getInfo()["coordinates"]
+    region_for_thumb = {"type": "Polygon", "coordinates": aoi_bounds}
+
+    collection, used_sensor, high_cloud, window = _search_images_with_expansion(aoi, start_date, end_date, sensor)
+    if collection is None and sensor == "Sentinel-2" and high_cloud:
+        collection, used_sensor, _, window = _search_images_with_expansion(aoi, start_date, end_date, "Sentinel-1")
+
+    if collection is None:
+        return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
+
+    image_list = collection.sort('system:time_start').toList(10)
+    count = image_list.size().getInfo()
+    if count == 0:
+        return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
+
+    # Collection path prefix needed to build a fully-qualified asset ID
+    collection_path = "COPERNICUS/S2_HARMONIZED" if used_sensor == "Sentinel-2" else "COPERNICUS/S1_GRD"
+
+    images = []
+    for i in range(count):
+        image = ee.Image(image_list.get(i))
+        bare_id = image.id().getInfo()
+        # ee.Image(bare_id) would fail — GEE requires the full collection-qualified path
+        asset_id = f"{collection_path}/{bare_id}" if bare_id and not bare_id.startswith("COPERNICUS/") else bare_id
+        # Clip the image to the AOI so getThumbURL has a bounded region to render
+        clipped = image.clip(aoi)
+        thumbnail_url = _render_thumbnail(clipped, used_sensor, asset_id, region=region_for_thumb)
+        metadata = _extract_image_metadata(image, used_sensor, region=region_for_thumb)
+        images.append({
+            "asset_id": asset_id,
+            "thumbnail_url": thumbnail_url,
+            "metadata": metadata,
+        })
+
+    return {"status": "success", "data": {"images": images}}
+
+def _compute_index(img: ee.Image, sensor: str, index_type: str):
+    """
+    Compute a normalised spectral index for a single image.
+    Routes to optical (S2) or SAR (S1) band logic based on sensor.
+    Returns an ee.Image with a single band named after the index.
+    """
+    is_sar = sensor == "Sentinel-1"
+
+    if is_sar:
+        # SAR change proxy: log-ratio of VV backscatter (dB scale)
+        vv = img.select("VV")
+        vh = img.select("VH") if index_type == "Log-Ratio" else None
+        if index_type == "Log-Ratio" and vh is not None:
+            index_img = vv.subtract(vh).rename("Log-Ratio")
+        else:
+            # Default SAR: use VV directly as a single-band proxy
+            index_img = vv.rename(index_type)
+    else:
+        # Optical (Sentinel-2) band routing
+        if index_type == "NBR":
+            nir = img.select("B8")
+            swir = img.select("B12")
+            index_img = nir.subtract(swir).divide(nir.add(swir)).rename("NBR")
+        elif index_type == "NDVI":
+            nir = img.select("B8")
+            red = img.select("B4")
+            index_img = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
+        elif index_type == "NDWI":
+            green = img.select("B3")
+            nir = img.select("B8")
+            index_img = green.subtract(nir).divide(green.add(nir)).rename("NDWI")
+        else:
+            index_img = ee.Image.constant(0).rename(index_type)
+
+    return index_img
+
+
+@catch_ee_errors
+def compute_mask_gee(
+    asset_ids: list,
+    sensor: str,
+    index_type: str,
+    threshold: float = -0.1,
+    adversarial: bool = False,
+):
+    """
+    Compute change-detection masks from a list of raw GEE asset IDs.
+    asset_ids must be valid COPERNICUS/* or projects/* strings — never thumbnail URLs.
+    """
+    if not asset_ids or len(asset_ids) < 2:
+        return {"status": "error", "message": "At least 2 asset IDs required for change detection"}
+
+    # Validate every entry is a real asset ID — reject URLs early with a clear message
+    invalid = [v for v in asset_ids if not _is_asset_id(v)]
+    if invalid:
+        return {
+            "status": "error",
+            "message": (
+                f"compute_mask received thumbnail URLs instead of asset IDs: {invalid}. "
+                "Pass the asset_id strings from load_imagery, not the thumbnail_url values."
+            ),
+        }
+
+    is_sar = sensor == "Sentinel-1"
+    images = [ee.Image(aid) for aid in asset_ids]
+    computed_masks = []
+    trend_analysis_parts = []
+
+    for i in range(len(images) - 1):
+        img1 = images[i]
+        img2 = images[i + 1]
+
+        # --- Compute spectral indices with dynamic band routing ---
+        idx1 = _compute_index(img1, sensor, index_type)
+        idx2 = _compute_index(img2, sensor, index_type)
+
+        # Raw difference image (pre-threshold)
+        diff = idx2.subtract(idx1)
+
+        # --- Adversarial flag: force physically impossible index values ---
+        anomaly_type = None
+        if adversarial:
+            diff = diff.multiply(1.5)
+            anomaly_type = "INDEX_SCALING_ERROR"
+
+        # --- Server-side min/max reducer (runs before visualisation) ---
+        img1_region = img1.geometry().bounds().getInfo()["coordinates"]
+        region_for_mask = {"type": "Polygon", "coordinates": img1_region}
+        geom = ee.Geometry.Polygon(img1_region)
+
+        band_name = diff.bandNames().get(0).getInfo()
+        try:
+            stats = diff.reduceRegion(
+                reducer=ee.Reducer.minMax(),
+                geometry=geom,
+                scale=30,
+                maxPixels=1e9,
+            ).getInfo()
+            idx_min = float(stats.get(f"{band_name}_min") or 0.0)
+            idx_max = float(stats.get(f"{band_name}_max") or 1.0)
+        except Exception:
+            idx_min, idx_max = 0.0, 1.0
+
+        # --- CRS extraction ---
+        try:
+            actual_crs = img1.select(0).projection().getInfo().get("crs", "UNKNOWN")
+        except Exception:
+            actual_crs = "UNKNOWN"
+        crs_alignment = (
+            "MATCH"
+            if (
+                actual_crs == "EPSG:4326"
+                or actual_crs.startswith("EPSG:326")   # UTM North zones
+                or actual_crs.startswith("EPSG:327")   # UTM South zones
+            )
+            else "MISMATCH"
+        )
+
+        # --- Threshold to binary change mask ---
+        if index_type == "NDWI" and not is_sar:
+            change = diff.gt(threshold)
+        else:
+            change = diff.lt(threshold)
+
+        # --- Visualise and export thumbnail ---
+        mask_image = change.clip(img1.geometry()).visualize(palette=["FFFFFF", "FF0000"], min=0, max=1)
+        mask_url = mask_image.getThumbURL({"dimensions": 512, "format": "png", "region": region_for_mask})
+        _validate_thumb_url(mask_url, f"mask between asset {i} and {i + 1}")
+
+        # --- Cloud cover (optical only) ---
+        if not is_sar:
+            try:
+                cloud_cover = float(img2.get("CLOUDY_PIXEL_PERCENTAGE").getInfo() or 0.0)
+            except Exception:
+                cloud_cover = 0.0
+        else:
+            cloud_cover = 0.0
+
+        # --- Timestamp ---
+        try:
+            ts_ms = img2.get("system:time_start").getInfo()
+            ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat() if ts_ms else datetime.now(tz=timezone.utc).isoformat()
+        except Exception:
+            ts = datetime.now(tz=timezone.utc).isoformat()
+
+        computed_masks.append({
+            "thumbnail_url": mask_url,
+            "metadata": {
+                "cloud_cover_percent": cloud_cover,
+                "crs_info": {
+                    "expected": "EPSG:4326 | UTM",
+                    "actual": actual_crs,
+                    "alignment": crs_alignment,
+                },
+                "index_stats": {"min": idx_min, "max": idx_max},
+                "timestamp": ts,
+                "anomaly_type": anomaly_type,
+            },
+        })
+
+        # --- Trend analysis ---
+        try:
+            area = (
+                change.multiply(ee.Image.pixelArea())
+                .reduceRegion(reducer=ee.Reducer.sum(), geometry=geom, scale=30, maxPixels=1e9)
+                .get("constant")
+                .getInfo()
+                / 1_000_000
+            )
+            trend_analysis_parts.append(
+                f"Change detected between asset {i} and {i + 1}: {area:.2f} km² affected area."
+            )
+        except Exception:
+            trend_analysis_parts.append(f"Change detected between asset {i} and {i + 1}.")
+
+    trend_analysis = " ".join(trend_analysis_parts) if trend_analysis_parts else "No significant changes detected."
+    return {"status": "success", "data": {"computed_masks": computed_masks, "trend_analysis": trend_analysis}}
