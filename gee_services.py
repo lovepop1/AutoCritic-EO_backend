@@ -114,7 +114,7 @@ def _extract_image_metadata(image, sensor: str, region=None) -> dict:
             "actual": actual_crs,
             "alignment": alignment,
         },
-        "index_stats": {"min": idx_min, "max": idx_max},
+        "optical_reflectance": {"min": idx_min, "max": idx_max},
         "timestamp": ts,
     }
 
@@ -260,8 +260,8 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
                 'max': 3000,
                 'dimensions': 512,
                 'format': 'png',
-                'region': roi,        # locks scale to exact tile footprint
-                'crs': 'EPSG:3857',   # Web Mercator — matches mask projection
+                'region': image.geometry(),  # raw tile geometry — no .bounds() squish
+                'crs': 'EPSG:3857',          # Web Mercator — prevents rotation, matches mask
             })
         else:
             # Sentinel-1: compute dynamic stretch then render
@@ -275,7 +275,7 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
             "metadata": metadata,
         })
 
-    return {"status": "success", "data": {"images": images}}
+    return {"status": "success", "data": {"images": images, "resolved_aoi": aoi_dict}}
 
 def _compute_index(img: ee.Image, sensor: str, index_type: str):
     """
@@ -326,8 +326,8 @@ def compute_mask_gee(
     Compute change-detection masks from a list of raw GEE asset IDs.
     asset_ids must be valid COPERNICUS/* or projects/* strings — never thumbnail URLs.
     """
-    if not asset_ids or len(asset_ids) < 2:
-        return {"status": "error", "message": "At least 2 asset IDs required for change detection"}
+    if not asset_ids or len(asset_ids) < 1:
+        return {"status": "error", "message": "At least 1 asset ID required for mask generation"}
 
     # Validate every entry is a real asset ID — reject URLs early with a clear message
     invalid = [v for v in asset_ids if not _is_asset_id(v)]
@@ -342,125 +342,129 @@ def compute_mask_gee(
 
     is_sar = sensor == "Sentinel-1"
     images = [ee.Image(aid) for aid in asset_ids]
-    computed_masks = []
+    mask_map = {}          # asset_id → {thumbnail_url, metadata} | None  (1:1 with inputs)
     trend_analysis_parts = []
 
-    for i in range(len(images) - 1):
-        img1 = images[i]
-        img2 = images[i + 1]
+    for i, img in enumerate(images):
+        asset_id = asset_ids[i]
 
-        # --- Compute spectral indices with dynamic band routing ---
-        idx1 = _compute_index(img1, sensor, index_type)
-        idx2 = _compute_index(img2, sensor, index_type)
-
-        # Raw difference image (pre-threshold)
-        diff = idx2.subtract(idx1)
-
-        # --- Adversarial flag: force physically impossible index values ---
-        anomaly_type = None
-        if adversarial:
-            diff = diff.multiply(1.5)
-            anomaly_type = "INDEX_SCALING_ERROR"
-
-        # --- Server-side min/max reducer (runs before visualisation) ---
-        img1_region = img1.geometry().bounds().getInfo()["coordinates"]
-        geom = ee.Geometry.Polygon(img1_region)
-
-        band_name = diff.bandNames().get(0).getInfo()
         try:
-            stats = diff.reduceRegion(
-                reducer=ee.Reducer.minMax(),
-                geometry=geom,
-                scale=30,
-                maxPixels=1e9,
-            ).getInfo()
-            idx_min = float(stats.get(f"{band_name}_min") or 0.0)
-            idx_max = float(stats.get(f"{band_name}_max") or 1.0)
-        except Exception:
-            idx_min, idx_max = 0.0, 1.0
+            # --- Absolute spectral index for this single image ---
+            index_img = _compute_index(img, sensor, index_type)
 
-        # --- CRS extraction ---
-        try:
-            actual_crs = img1.select(0).projection().getInfo().get("crs", "UNKNOWN")
-        except Exception:
-            actual_crs = "UNKNOWN"
-        crs_alignment = (
-            "MATCH"
-            if (
-                actual_crs == "EPSG:4326"
-                or actual_crs.startswith("EPSG:326")   # UTM North zones
-                or actual_crs.startswith("EPSG:327")   # UTM South zones
+            # --- Adversarial flag: scale the absolute index to force impossible values ---
+            anomaly_type = None
+            if adversarial:
+                index_img = index_img.multiply(1.5)
+                anomaly_type = "INDEX_SCALING_ERROR"
+
+            # --- Index config: threshold applied to the ABSOLUTE index, not a difference ---
+            config = INDEX_VIS_CONFIG.get(
+                index_type.upper() if index_type else "DEFAULT",
+                INDEX_VIS_CONFIG["DEFAULT"],
             )
-            else "MISMATCH"
-        )
 
-        # --- Dynamic threshold + selfMask visualisation ---
-        config = INDEX_VIS_CONFIG.get(index_type.upper() if index_type else "DEFAULT", INDEX_VIS_CONFIG["DEFAULT"])
+            if config["operator"] == "gt":
+                binary_image = index_img.gt(config["threshold"])
+            else:
+                binary_image = index_img.lt(config["threshold"])
 
-        # Binary image: 1 where the condition is met, 0 elsewhere
-        if config["operator"] == "gt":
-            binary_image = diff.gt(config["threshold"])
-        else:
-            binary_image = diff.lt(config["threshold"])
+            visual_mask = binary_image.selfMask()
 
-        # roi matches the optical thumbnail exactly — same .bounds() call, same CRS
-        roi = img1.geometry().bounds()
-        visual_mask = binary_image.selfMask()
-
-        mask_url = visual_mask.getThumbURL({
-            "palette": config["palette"],
-            "dimensions": 512,
-            "format": "png",
-            "region": roi,        # locks scale — matches optical exactly
-            "crs": "EPSG:3857",   # Web Mercator — matches optical exactly
-        })
-        _validate_thumb_url(mask_url, f"mask between asset {i} and {i + 1}")
-
-        # --- Cloud cover (optical only) ---
-        if not is_sar:
+            # --- Server-side min/max reducer on the absolute index (for metadata) ---
+            img_region = img.geometry().bounds().getInfo()["coordinates"]
+            geom = ee.Geometry.Polygon(img_region)
+            band_name = index_img.bandNames().get(0).getInfo()
             try:
-                cloud_cover = float(img2.get("CLOUDY_PIXEL_PERCENTAGE").getInfo() or 0.0)
+                stats = index_img.reduceRegion(
+                    reducer=ee.Reducer.minMax(),
+                    geometry=geom,
+                    scale=30,
+                    maxPixels=1e9,
+                ).getInfo()
+                idx_min = float(stats.get(f"{band_name}_min") or 0.0)
+                idx_max = float(stats.get(f"{band_name}_max") or 1.0)
             except Exception:
+                idx_min, idx_max = 0.0, 1.0
+
+            # --- CRS extraction ---
+            try:
+                actual_crs = img.select(0).projection().getInfo().get("crs", "UNKNOWN")
+            except Exception:
+                actual_crs = "UNKNOWN"
+            crs_alignment = (
+                "MATCH"
+                if (
+                    actual_crs == "EPSG:4326"
+                    or actual_crs.startswith("EPSG:326")   # UTM North zones
+                    or actual_crs.startswith("EPSG:327")   # UTM South zones
+                )
+                else "MISMATCH"
+            )
+
+            # --- Thumbnail ---
+            roi = img.geometry()
+            mask_url = visual_mask.getThumbURL({
+                "palette": config["palette"],
+                "dimensions": 512,
+                "format": "png",
+                "region": roi,
+                "crs": "EPSG:3857",
+            })
+            _validate_thumb_url(mask_url, f"mask for asset {asset_id}")
+
+            # --- Cloud cover (optical only) ---
+            if not is_sar:
+                try:
+                    cloud_cover = float(img.get("CLOUDY_PIXEL_PERCENTAGE").getInfo() or 0.0)
+                except Exception:
+                    cloud_cover = 0.0
+            else:
                 cloud_cover = 0.0
-        else:
-            cloud_cover = 0.0
 
-        # --- Timestamp ---
-        try:
-            ts_ms = img2.get("system:time_start").getInfo()
-            ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat() if ts_ms else datetime.now(tz=timezone.utc).isoformat()
-        except Exception:
-            ts = datetime.now(tz=timezone.utc).isoformat()
+            # --- Timestamp ---
+            try:
+                ts_ms = img.get("system:time_start").getInfo()
+                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat() if ts_ms else datetime.now(tz=timezone.utc).isoformat()
+            except Exception:
+                ts = datetime.now(tz=timezone.utc).isoformat()
 
-        computed_masks.append({
-            "thumbnail_url": mask_url,
-            "metadata": {
-                "cloud_cover_percent": cloud_cover,
-                "crs_info": {
-                    "expected": "EPSG:4326 | UTM",
-                    "actual": actual_crs,
-                    "alignment": crs_alignment,
+            mask_map[asset_id] = {
+                "thumbnail_url": mask_url,
+                "metadata": {
+                    "cloud_cover_percent": cloud_cover,
+                    "crs_info": {
+                        "expected": "EPSG:4326 | UTM",
+                        "actual": actual_crs,
+                        "alignment": crs_alignment,
+                    },
+                    "index_stats": {"min": idx_min, "max": idx_max},
+                    "timestamp": ts,
+                    "anomaly_type": anomaly_type,
                 },
-                "index_stats": {"min": idx_min, "max": idx_max},
-                "timestamp": ts,
-                "anomaly_type": anomaly_type,
-            },
-        })
+            }
 
-        # --- Trend analysis ---
-        try:
-            area = (
-                binary_image.multiply(ee.Image.pixelArea())
-                .reduceRegion(reducer=ee.Reducer.sum(), geometry=geom, scale=30, maxPixels=1e9)
-                .get("constant")
-                .getInfo()
-                / 1_000_000
-            )
-            trend_analysis_parts.append(
-                f"Change detected between asset {i} and {i + 1}: {area:.2f} km² affected area."
-            )
-        except Exception:
-            trend_analysis_parts.append(f"Change detected between asset {i} and {i + 1}.")
+            # --- Trend analysis: absolute area where index threshold is met ---
+            try:
+                area_image = ee.Image.pixelArea().updateMask(binary_image)
+                area_stats = area_image.reduceRegion(
+                    reducer=ee.Reducer.sum(),
+                    geometry=geom,
+                    scale=10,       # native Sentinel-2 resolution
+                    maxPixels=1e9,
+                ).getInfo()
+                area_sq_meters = list(area_stats.values())[0] if area_stats and list(area_stats.values()) else 0.0
+                area_sq_km = area_sq_meters / 1e6
+                trend_analysis_parts.append(
+                    f"Asset {asset_id} computed {index_type} area: {area_sq_km:.2f} sq km."
+                )
+            except Exception:
+                trend_analysis_parts.append(f"Asset {asset_id}: area calculation failed.")
+
+        except Exception as e:
+            # Tile failed entirely — record None so downstream indexing stays aligned
+            mask_map[asset_id] = None
+            trend_analysis_parts.append(f"Mask generation failed for asset {asset_id}: {e}")
 
     trend_analysis = " ".join(trend_analysis_parts) if trend_analysis_parts else "No significant changes detected."
-    return {"status": "success", "data": {"computed_masks": computed_masks, "trend_analysis": trend_analysis}}
+    return {"status": "success", "data": {"computed_masks": mask_map, "trend_analysis": trend_analysis}}

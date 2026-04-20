@@ -220,6 +220,7 @@ async def load_imagery(request: dict):
         }
 
     images = result["data"]["images"]
+    resolved_aoi = result["data"].get("resolved_aoi", aoi)
 
     # --- Live adversarial corruption: mutate real GEE metadata before returning ---
     if adversarial:
@@ -239,7 +240,17 @@ async def load_imagery(request: dict):
         # Store asset IDs for stateless downstream routing
         vertex_outputs[vertex_id] = {"image_ids": [img["asset_id"] for img in images]}
 
-    response_data = {"status": "success", "data": {"images": images}}
+    response_data = {
+        "status": "success",
+        "data": {
+            "query_metadata": {
+                "resolved_aoi": resolved_aoi,   # exact GeoJSON polygon used for the GEE query
+                "sensor": sensor,
+                "date_range": date_range,
+            },
+            "images": images,
+        },
+    }
     print(f"LOAD IMAGERY RESPONSE: {response_data}")
     return response_data
 
