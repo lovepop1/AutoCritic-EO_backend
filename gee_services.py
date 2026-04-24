@@ -4,6 +4,7 @@ import uuid
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from fastapi import HTTPException
 
 load_dotenv()
 
@@ -198,7 +199,13 @@ def _search_images_with_expansion(aoi, start_date: str, end_date: str, sensor: s
 @catch_ee_errors
 def check_availability_gee(aoi_dict: dict, date_range: list, sensor: str):
     aoi = ee.Geometry.Polygon(aoi_dict["coordinates"])
-    start_date, end_date = date_range[0], date_range[1]
+    
+    start_date = date_range[0]
+    end_date = date_range[1]
+
+    if start_date == end_date:
+        dt = datetime.strptime(end_date, "%Y-%m-%d")
+        end_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
     collection, used_sensor, high_cloud, window = _search_images_with_expansion(aoi, start_date, end_date, sensor)
     if collection is None and sensor == "Sentinel-2" and high_cloud:
@@ -220,7 +227,13 @@ def check_availability_gee(aoi_dict: dict, date_range: list, sensor: str):
 @catch_ee_errors
 def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
     aoi = ee.Geometry.Polygon(aoi_dict["coordinates"])
-    start_date, end_date = date_range[0], date_range[1]
+    
+    start_date = date_range[0]
+    end_date = date_range[1]
+
+    if start_date == end_date:
+        dt = datetime.strptime(end_date, "%Y-%m-%d")
+        end_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Get the AOI bounding box as a GeoJSON-compatible region dict for getThumbURL
     aoi_bounds = aoi.bounds().getInfo()["coordinates"]
@@ -329,16 +342,16 @@ def compute_mask_gee(
     if not asset_ids or len(asset_ids) < 1:
         return {"status": "error", "message": "At least 1 asset ID required for mask generation"}
 
-    # Validate every entry is a real asset ID — reject URLs early with a clear message
+    # Validate every entry is a real asset ID — reject URLs/placeholders early as a 400
     invalid = [v for v in asset_ids if not _is_asset_id(v)]
     if invalid:
-        return {
-            "status": "error",
-            "message": (
-                f"compute_mask received thumbnail URLs instead of asset IDs: {invalid}. "
-                "Pass the asset_id strings from load_imagery, not the thumbnail_url values."
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "compute_mask received invalid IDs or placeholders. "
+                "You MUST pass the actual 'asset_id' strings returned from load_imagery."
             ),
-        }
+        )
 
     is_sar = sensor == "Sentinel-1"
     images = [ee.Image(aid) for aid in asset_ids]

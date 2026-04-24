@@ -1,4 +1,5 @@
 import uuid
+import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from database import get_imagery_cache, set_imagery_cache, get_mask_cache, set_mask_cache
@@ -7,6 +8,8 @@ from datetime import datetime, timedelta
 import re
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AutoCritic-EO Backend", description="GIS Backend API for AutoCritic-EO")
 
@@ -52,23 +55,84 @@ def _is_valid_url_list(items: list) -> bool:
     )
 
 def geocode_location_to_aoi(location: str):
+    """
+    Resolve a free-text location string to a GeoJSON Polygon AOI.
+
+    Resolution order:
+      1. Hard-coded AOI_MAP (instant, no network call).
+      2. Nominatim geocoding with full error handling.
+
+    Raises:
+        HTTPException(400): If the location string is non-empty but cannot be
+            resolved — either because Nominatim returns None, returns a result
+            without a bounding box, or throws a network/timeout error.  The
+            detail message is structured so the LLM can understand WHY the
+            request failed and prompt the user to supply a GeoJSON AOI instead.
+    """
     location = location.strip()
     if not location:
         return None
+
+    # 1. Fast-path: known locations
     if location in AOI_MAP:
         return AOI_MAP[location]
+
+    # 2. Nominatim geocoding with graceful fallback
     try:
-        geo = geolocator.geocode(location, exactly_one=True)
-    except (GeocoderTimedOut, GeocoderUnavailable):
-        return None
+        geo = geolocator.geocode(location, exactly_one=True, timeout=10)
+    except GeocoderTimedOut:
+        logger.warning("Geocoding timed out for '%s'", location)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"GEOCODING_FAILED: Nominatim timed out while resolving '{location}'. "
+                "Please provide a GeoJSON AOI polygon in the 'aoi' field instead."
+            ),
+        )
+    except GeocoderUnavailable as exc:
+        logger.warning("Geocoding service unavailable for '%s': %s", location, exc)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"GEOCODING_FAILED: Geocoding service is temporarily unavailable for '{location}'. "
+                "Please provide a GeoJSON AOI polygon in the 'aoi' field instead."
+            ),
+        )
+    except Exception as exc:
+        logger.error("Unexpected geocoding error for '%s': %s", location, exc)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"GEOCODING_FAILED: Unexpected error resolving '{location}': {exc}. "
+                "Please provide a GeoJSON AOI polygon in the 'aoi' field instead."
+            ),
+        )
+
     if not geo or not getattr(geo, "raw", None):
-        return None
+        logger.warning("Nominatim returned no result for '%s'", location)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"GEOCODING_FAILED: Could not resolve coordinates for '{location}'. "
+                "Nominatim returned no match. Please check the location name or provide "
+                "a GeoJSON AOI polygon in the 'aoi' field instead."
+            ),
+        )
+
     bbox = geo.raw.get("boundingbox")
     if not bbox or len(bbox) != 4:
-        return None
+        logger.warning("Nominatim result for '%s' has no bounding box: %s", location, geo.raw)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"GEOCODING_FAILED: Nominatim matched '{location}' but returned no usable "
+                "bounding box. Please provide a GeoJSON AOI polygon in the 'aoi' field instead."
+            ),
+        )
+
     south, north, west, east = map(float, bbox)
-    
-    # Constrain bounding box to max ~25-30km span (0.25 deg) to prevent massive GEE payloads
+
+    # Constrain bounding box to max ~25-30 km span (0.25 deg) to prevent massive GEE payloads
     height, width = north - south, east - west
     max_span = 0.25
     if height > max_span or width > max_span:
@@ -76,24 +140,34 @@ def geocode_location_to_aoi(location: str):
         height, width = min(height, max_span), min(width, max_span)
         south, north = lat_center - (height / 2.0), lat_center + (height / 2.0)
         west, east = lon_center - (width / 2.0), lon_center + (width / 2.0)
-        
+
     return {
         "type": "Polygon",
-        "coordinates": [[[west, south], [east, south], [east, north], [west, north], [west, south]]]
+        "coordinates": [[[west, south], [east, south], [east, north], [west, north], [west, south]]],
     }
 
 
 def resolve_aoi(request: dict):
+    """Extract a GeoJSON AOI dict from an incoming request payload.
+
+    Priority:
+      1. Explicit ``aoi`` dict in the payload.
+      2. ``location`` string → geocoded AOI (raises HTTPException on failure).
+      3. ``location`` as a raw GeoJSON Polygon dict.
+
+    Raises:
+        HTTPException(400): If no usable AOI can be derived.
+    """
     if isinstance(request.get("aoi"), dict):
         return request["aoi"]
     location = request.get("location")
     if isinstance(location, str) and location.strip():
-        aoi = geocode_location_to_aoi(location)
-        if aoi:
-            return aoi
+        # geocode_location_to_aoi raises HTTPException on any geocoding failure;
+        # it only returns None for an empty string (guarded above).
+        return geocode_location_to_aoi(location)
     if isinstance(location, dict) and location.get("type") == "Polygon":
         return location
-    raise ValueError("No valid AOI or location provided")
+    raise HTTPException(status_code=400, detail="No valid AOI or location provided in the request.")
 
 def parse_date_range(date_param):
     """Convert AI date parameter to GEE date range."""
@@ -162,10 +236,7 @@ def resolve_file_reference(file_param):
 
 @app.post("/api/v1/check_availability")
 async def check_availability(request: dict):
-    try:
-        aoi = resolve_aoi(request)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    aoi = resolve_aoi(request)  # raises HTTPException(400) on any AOI/geocoding failure
 
     date_param = request.get("date_range") or request.get("date") or "2024-10-30"
     sensor = request.get("sensor", "optical")
@@ -194,10 +265,7 @@ async def load_imagery(request: dict):
     print("LOAD IMAGERY PAYLOAD:", request)
     adversarial = bool(request.get("adversarial", False))
 
-    try:
-        aoi = resolve_aoi(request)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid payload received: {request}. Error: {str(e)}")
+    aoi = resolve_aoi(request)  # raises HTTPException(400) on any AOI/geocoding failure
 
     date_range_param = request.get("date_range") or request.get("date") or ["2024-10-29", "2024-10-31"]
     sensor = request.get("sensor", "optical")
