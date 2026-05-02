@@ -19,22 +19,24 @@ def generate_hash(data: dict) -> str:
     data_str = json.dumps(data, sort_keys=True)
     return hashlib.sha256(data_str.encode("utf-8")).hexdigest()
 
-def get_imagery_cache(aoi: dict, date_range: list, sensor: str):
+def get_imagery_cache(aoi: dict, date_range: list, sensor: str, locked_tiles: list = None):
     query_hash = generate_hash({
         "aoi": aoi,
         "date_range": date_range,
-        "sensor": sensor
+        "sensor": sensor,
+        "locked_tiles": locked_tiles or [],
     })
     res = supabase.table("imagery_cache").select("*").eq("query_hash", query_hash).execute()
     if res.data:
         return res.data[0].get("file_list", [])
     return None
 
-def set_imagery_cache(aoi: dict, date_range: list, sensor: str, file_list: list):
+def set_imagery_cache(aoi: dict, date_range: list, sensor: str, file_list: list, locked_tiles: list = None):
     query_hash = generate_hash({
         "aoi": aoi,
         "date_range": date_range,
-        "sensor": sensor
+        "sensor": sensor,
+        "locked_tiles": locked_tiles or [],
     })
     data = {
         "query_hash": query_hash,

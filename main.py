@@ -271,9 +271,9 @@ async def load_imagery(request: dict):
     sensor = request.get("sensor", "optical")
     date_range = parse_date_range(date_range_param)
     sensor = SENSOR_MAP.get(sensor, "Sentinel-2")
+    locked_tiles = request.get("locked_tiles") or None  # optional MGRS tile lock
 
-    cache_key = (str(aoi), str(date_range), sensor)
-    cached_files = get_imagery_cache(*cache_key)
+    cached_files = get_imagery_cache(aoi, date_range, sensor, locked_tiles)
     if not adversarial and cached_files is not None and _is_valid_url_list(cached_files):
         return {"status": "success", "data": {"images": cached_files}}
 
@@ -289,6 +289,7 @@ async def load_imagery(request: dict):
 
     images = result["data"]["images"]
     resolved_aoi = result["data"].get("resolved_aoi", aoi)
+    used_sensor = result["data"].get("used_sensor", sensor)
 
     # --- Live adversarial corruption: mutate real GEE metadata before returning ---
     if adversarial:
@@ -301,7 +302,7 @@ async def load_imagery(request: dict):
             img["metadata"]["adversarial_corrupted"] = True
 
     if not adversarial:
-        set_imagery_cache(*cache_key, images)
+        set_imagery_cache(aoi, date_range, sensor, images, locked_tiles)
 
     vertex_id = request.get("vertex_id")
     if vertex_id:
@@ -312,8 +313,9 @@ async def load_imagery(request: dict):
         "status": "success",
         "data": {
             "query_metadata": {
-                "resolved_aoi": resolved_aoi,   # exact GeoJSON polygon used for the GEE query
+                "resolved_aoi": resolved_aoi,
                 "sensor": sensor,
+                "used_sensor": used_sensor,     # actual sensor used — may differ if SAR fallback fired
                 "date_range": date_range,
             },
             "images": images,
@@ -347,12 +349,18 @@ async def compute_mask(request: dict):
     sensor = SENSOR_MAP.get(request.get("sensor", "Sentinel-2"), "Sentinel-2")
     adversarial = bool(request.get("adversarial", False))
 
+    # Resolve AOI — used to align mask thumbnail geometry with optical thumbnail geometry
+    try:
+        aoi = resolve_aoi(request)
+    except HTTPException:
+        aoi = None
+
     cache_key = (str(asset_ids), index)
     cached_mask = get_mask_cache(*cache_key)
-    if not adversarial and cached_mask is not None and _is_valid_url_list(cached_mask.get("computed_masks", [])):
-        result = {"status": "success", "data": cached_mask}
+    if not adversarial and cached_mask is not None and isinstance(cached_mask.get("computed_masks"), dict):
+        data = cached_mask
     else:
-        result = gee_services.compute_mask_gee(asset_ids, sensor, index, threshold, adversarial=adversarial)
+        result = gee_services.compute_mask_gee(asset_ids, sensor, index, threshold, adversarial=adversarial, aoi_dict=aoi)
         if result.get("status") == "error":
             raise HTTPException(status_code=500, detail=result["message"])
 
@@ -360,11 +368,23 @@ async def compute_mask(request: dict):
         if not adversarial:
             set_mask_cache(*cache_key, data["computed_masks"], data["trend_analysis"])
 
+    # Build the exact dict the orchestrator expects: asset_id → mask entry (preserves insertion order)
+    raw_masks = data.get("computed_masks", {})
+    computed_masks_dict = {asset_id: raw_masks.get(asset_id) for asset_id in asset_ids}
+
+    response = {
+        "status": "success",
+        "data": {
+            "computed_masks": computed_masks_dict,
+            "trend_analysis": data.get("trend_analysis", ""),
+        },
+    }
+
     vertex_id = request.get("vertex_id")
     if vertex_id:
-        vertex_outputs[vertex_id] = result["data"]
+        vertex_outputs[vertex_id] = response["data"]
 
-    return result
+    return response
 
 if __name__ == "__main__":
     import uvicorn

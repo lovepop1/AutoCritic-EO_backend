@@ -53,6 +53,7 @@ class LoadImageryRequest(BaseModel):
     date_range: Union[str, List[str]]
     sensor: Literal["Sentinel-1", "Sentinel-2", "optical", "SAR"] = "optical"
     bands: Optional[str] = None
+    locked_tiles: Optional[List[str]] = None  # MGRS tile IDs to lock spatial extent
 
 
 class ImageryItem(BaseModel):

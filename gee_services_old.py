@@ -99,7 +99,7 @@ def _extract_image_metadata(image, sensor: str, region=None) -> dict:
         stats = image.select(0).reduceRegion(
             reducer=ee.Reducer.minMax(),
             geometry=geom,
-            scale=10,
+            scale=100,
             maxPixels=1e9,
         ).getInfo()
         band_name = list(stats.keys())[0].rsplit("_", 1)[0] if stats else "b1"
@@ -140,7 +140,7 @@ def _render_thumbnail(image, sensor: str, asset_id: str = None, region=None):
             stats = image.reduceRegion(
                 reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
                 geometry=geom,
-                scale=10,
+                scale=100,
                 maxPixels=1e9
             ).getInfo()
             if stats and 'VV_mean' in stats and 'VV_stdDev' in stats and stats['VV_stdDev'] is not None:
@@ -235,6 +235,7 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
         dt = datetime.strptime(end_date, "%Y-%m-%d")
         end_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
+    # Get the AOI bounding box as a GeoJSON-compatible region dict for getThumbURL
     aoi_bounds = aoi.bounds().getInfo()["coordinates"]
     region_for_thumb = {"type": "Polygon", "coordinates": aoi_bounds}
 
@@ -245,61 +246,49 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
     if collection is None:
         return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
 
-    # Grab up to 24 images to ensure we span multiple dates without timing out
-    image_list = collection.sort('system:time_start').toList(24)
+    image_list = collection.sort('system:time_start').toList(10)
     count = image_list.size().getInfo()
     if count == 0:
         return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
 
+    # Collection path prefix needed to build a fully-qualified asset ID
     collection_path = "COPERNICUS/S2_HARMONIZED" if used_sensor == "Sentinel-2" else "COPERNICUS/S1_GRD"
 
-    # --- Safe, sequential grouping ---
-    from collections import defaultdict
-    grouped_by_date = defaultdict(list)
-    
-    # Process metadata first to safely group by date
+    images = []
     for i in range(count):
         image = ee.Image(image_list.get(i))
-        ts_ms = image.get('system:time_start').getInfo()
-        date_str = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d') if ts_ms else "unknown"
-        grouped_by_date[date_str].append(image)
+        bare_id = image.id().getInfo()
+        # ee.Image(bare_id) would fail — GEE requires the full collection-qualified path
+        asset_id = f"{collection_path}/{bare_id}" if bare_id and not bare_id.startswith("COPERNICUS/") else bare_id
 
-    # Keep only the first 4 dates
-    sorted_dates = sorted(list(grouped_by_date.keys()))[:4]
+        # --- Optical thumbnail: identical region + CRS to mask thumbnails ---
+        roi = image.geometry().bounds()  # North-Up axis-aligned bounding box
 
-    images = []
-    # Download thumbnails ONLY for the 4 dates we kept
-    for d in sorted_dates:
-        for image in grouped_by_date[d]:
-            bare_id = image.id().getInfo()
-            asset_id = f"{collection_path}/{bare_id}" if bare_id and not bare_id.startswith("COPERNICUS/") else bare_id
-
-            roi = image.geometry().bounds()
-
-            if used_sensor == "Sentinel-2":
-                img_transparent = image.updateMask(image.select('B4').gt(0))
-                thumbnail_url = img_transparent.getThumbURL({
-                    'bands': ['B4', 'B3', 'B2'],
-                    'min': 0,
-                    'max': 3000,
-                    'dimensions': 512,
-                    'format': 'png',
-                    'region': image.geometry(),
-                    'crs': 'EPSG:3857',
-                })
-            else:
-                thumbnail_url = _render_thumbnail(image.clip(aoi), used_sensor, asset_id, region=roi)
-
-            _validate_thumb_url(thumbnail_url, asset_id)
-            metadata = _extract_image_metadata(image, used_sensor, region=region_for_thumb)
-            images.append({
-                "asset_id": asset_id,
-                "thumbnail_url": thumbnail_url,
-                "metadata": metadata,
+        if used_sensor == "Sentinel-2":
+            # Mask out NoData (black fill) pixels so background is transparent
+            img_transparent = image.updateMask(image.select('B4').gt(0))
+            thumbnail_url = img_transparent.getThumbURL({
+                'bands': ['B4', 'B3', 'B2'],
+                'min': 0,
+                'max': 3000,
+                'dimensions': 512,
+                'format': 'png',
+                'region': image.geometry(),  # raw tile geometry — no .bounds() squish
+                'crs': 'EPSG:3857',          # Web Mercator — prevents rotation, matches mask
             })
+        else:
+            # Sentinel-1: compute dynamic stretch then render
+            thumbnail_url = _render_thumbnail(image.clip(aoi), used_sensor, asset_id, region=roi)
+
+        _validate_thumb_url(thumbnail_url, asset_id)
+        metadata = _extract_image_metadata(image, used_sensor, region=region_for_thumb)
+        images.append({
+            "asset_id": asset_id,
+            "thumbnail_url": thumbnail_url,
+            "metadata": metadata,
+        })
 
     return {"status": "success", "data": {"images": images, "resolved_aoi": aoi_dict}}
-
 
 def _compute_index(img: ee.Image, sensor: str, index_type: str):
     """
@@ -345,7 +334,6 @@ def compute_mask_gee(
     index_type: str,
     threshold: float = -0.1,
     adversarial: bool = False,
-    **kwargs
 ):
     """
     Compute change-detection masks from a list of raw GEE asset IDs.
@@ -404,7 +392,7 @@ def compute_mask_gee(
                 stats = index_img.reduceRegion(
                     reducer=ee.Reducer.minMax(),
                     geometry=geom,
-                    scale=100,       # <--- CHANGED TO 100
+                    scale=30,
                     maxPixels=1e9,
                 ).getInfo()
                 idx_min = float(stats.get(f"{band_name}_min") or 0.0)
@@ -475,7 +463,7 @@ def compute_mask_gee(
                 area_stats = area_image.reduceRegion(
                     reducer=ee.Reducer.sum(),
                     geometry=geom,
-                    scale=100,       # <--- CHANGED TO 100
+                    scale=10,       # native Sentinel-2 resolution
                     maxPixels=1e9,
                 ).getInfo()
                 area_sq_meters = list(area_stats.values())[0] if area_stats and list(area_stats.values()) else 0.0
