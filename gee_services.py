@@ -291,6 +291,16 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
                 thumbnail_url = _render_thumbnail(image.clip(aoi), used_sensor, asset_id, region=roi)
 
             _validate_thumb_url(thumbnail_url, asset_id)
+
+            # CRITICAL: Capturing pixels immediately prevents 401 token expiry.
+            import requests as _req, base64 as _b64
+            try:
+                _r = _req.get(thumbnail_url, timeout=30)
+                _r.raise_for_status()
+                thumbnail_url = "data:image/png;base64," + _b64.b64encode(_r.content).decode("utf-8")
+            except Exception:
+                pass # Fallback to raw URL if download fails
+
             metadata = _extract_image_metadata(image, used_sensor, region=region_for_thumb)
             images.append({
                 "asset_id": asset_id,
@@ -437,6 +447,17 @@ def compute_mask_gee(
                 "crs": "EPSG:3857",
             })
             _validate_thumb_url(mask_url, f"mask for asset {asset_id}")
+
+            # ROBUST BASE64 CAPTURE
+            import requests as _req, base64 as _b64, sys as _sys
+            try:
+                _r = _req.get(mask_url, timeout=30)
+                if _r.status_code == 200:
+                    mask_url = "data:image/png;base64," + _b64.b64encode(_r.content).decode("utf-8")
+                else:
+                    print(f"BACKEND ERROR: GEE returned {_r.status_code} for mask URL", file=_sys.stderr)
+            except Exception as _e:
+                print(f"BACKEND EXCEPTION: Failed to encode mask: {_e}", file=_sys.stderr)
 
             # --- Cloud cover (optical only) ---
             if not is_sar:
