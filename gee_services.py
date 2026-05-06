@@ -47,10 +47,11 @@ thumbnail_to_asset_map = {}  # retained for legacy callers; no longer written to
 # Per-index visualisation config: threshold, logical operator, and colour palette.
 # The threshold here is applied to the *difference* image (idx2 - idx1).
 INDEX_VIS_CONFIG = {
-    "NDWI":    {"threshold":  0.1,  "operator": "gt", "palette": ["0000FF"]},  # blue  — water gain
-    "NDVI":    {"threshold":  0.2,  "operator": "gt", "palette": ["00FF00"]},  # green — vegetation gain
-    "NBR":     {"threshold": -0.1,  "operator": "lt", "palette": ["FF0000"]},  # red   — burn scars
-    "DEFAULT": {"threshold":  0.0,  "operator": "gt", "palette": ["FF0000"]},
+    "NDWI":      {"threshold":  0.1,  "operator": "gt", "palette": ["0000FF"]},  # blue  — water gain
+    "NDVI":      {"threshold":  0.2,  "operator": "gt", "palette": ["00FF00"]},  # green — vegetation gain
+    "NBR":       {"threshold": -0.1,  "operator": "lt", "palette": ["FF0000"]},  # red   — burn scars
+    "LOG-RATIO": {"threshold": -20.0, "operator": "lt", "palette": ["0000FF"]},  # blue  — SAR water/flood
+    "DEFAULT":   {"threshold":  0.0,  "operator": "gt", "palette": ["FF0000"]},
 }
 
 
@@ -155,10 +156,8 @@ def _render_thumbnail(image, sensor: str, asset_id: str = None, region=None):
     thumb_params = {
         'dimensions': 512,
         'format': 'png',
-        'crs': 'EPSG:3857',  # Web Mercator — matches mask thumbnails exactly
+        'crs': 'EPSG:3857',
     }
-    # region must be an ee.Geometry so GEE can reproject it into EPSG:3857 correctly.
-    # Callers pass image.geometry().bounds() — a server-side axis-aligned rectangle.
     if region is not None:
         thumb_params['region'] = region
 
@@ -225,8 +224,11 @@ def check_availability_gee(aoi_dict: dict, date_range: list, sensor: str):
 
 
 @catch_ee_errors
-def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
+def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str, locked_anchors: list = None):
     aoi = ee.Geometry.Polygon(aoi_dict["coordinates"])
+    # Buffer the AOI by 2.5km to ensure we discover all potentially 'Beautiful' 
+    # adjacent tiles. However, we will still prioritize the original AOI for anchoring.
+    search_aoi = aoi.buffer(2500).bounds()
     
     start_date = date_range[0]
     end_date = date_range[1]
@@ -238,39 +240,155 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
     aoi_bounds = aoi.bounds().getInfo()["coordinates"]
     region_for_thumb = {"type": "Polygon", "coordinates": aoi_bounds}
 
-    collection, used_sensor, high_cloud, window = _search_images_with_expansion(aoi, start_date, end_date, sensor)
+    collection, used_sensor, high_cloud, window = _search_images_with_expansion(search_aoi, start_date, end_date, sensor)
     if collection is None and sensor == "Sentinel-2" and high_cloud:
-        collection, used_sensor, _, window = _search_images_with_expansion(aoi, start_date, end_date, "Sentinel-1")
+        collection, used_sensor, _, window = _search_images_with_expansion(search_aoi, start_date, end_date, "Sentinel-1")
 
     if collection is None:
         return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
 
-    # Grab up to 24 images to ensure we span multiple dates without timing out
-    image_list = collection.sort('system:time_start').toList(24)
+    # Grab up to 200 images to ensure we discover all dates and tiles (prevents list truncation)
+    image_list = collection.sort('system:time_start').toList(200)
     count = image_list.size().getInfo()
     if count == 0:
         return {"status": "no_data", "message": "No optical or SAR imagery available for the requested area and timeframe."}
 
-    collection_path = "COPERNICUS/S2_HARMONIZED" if used_sensor == "Sentinel-2" else "COPERNICUS/S1_GRD"
+    # --- Batch Metadata Fetch (Crucial to avoid 401 timeouts) ---
+    # We fetch all indices and cloud cover metrics in ONE server-side call.
+    try:
+        # We need system:index (for MGRS/Orbit) and CLOUDY_PIXEL_PERCENTAGE
+        raw_metadata = collection.reduceColumns(
+            reducer=ee.Reducer.toList().repeat(2),
+            selectors=['system:index', 'CLOUDY_PIXEL_PERCENTAGE']
+        ).getInfo().get('list', [[], []])
+        # raw_metadata is [[idx1, idx2...], [cc1, cc2...]]
+    except Exception as e:
+        logger.error(f"[gee_services] Metadata batch fetch failed: {e}")
+        raw_metadata = [[], []]
 
-    # --- Safe, sequential grouping ---
     from collections import defaultdict
-    grouped_by_date = defaultdict(list)
+    grouped_by_date = defaultdict(list)   # stores (ee.Image, mgrs_code, cloud_cover) tuples
     
-    # Process metadata first to safely group by date
+    system_indices = raw_metadata[0]
+    cloud_covers = raw_metadata[1]
+
     for i in range(count):
         image = ee.Image(image_list.get(i))
-        ts_ms = image.get('system:time_start').getInfo()
-        date_str = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d') if ts_ms else "unknown"
-        grouped_by_date[date_str].append(image)
+        
+        # Extract MGRS/Orbit code from pre-fetched system:index
+        sys_idx = system_indices[i] if i < len(system_indices) else ""
+        mgrs = sys_idx.split('_')[-1] if '_' in sys_idx else ""
+        
+        # Extract Cloud Cover from pre-fetched list
+        cc = float(cloud_covers[i]) if (i < len(cloud_covers) and cloud_covers[i] is not None) else 100.0
+        
+        # Get timestamp (we still need this info, but it's usually stable)
+        # To be ultra-safe, we could have batched this too, but 1-2 getInfos for dates is okay.
+        # Actually, let's just parse it from sys_idx if possible for speed.
+        # S2 index format: 20220826T055639_...
+        try:
+            date_part = sys_idx.split('_')[0].split('T')[0]
+            date_str = datetime.strptime(date_part, '%Y%m%d').strftime('%Y-%m-%d')
+        except:
+            date_str = "unknown"
+
+        grouped_by_date[date_str].append((image, mgrs, cc))
 
     # Keep only the first 4 dates
-    sorted_dates = sorted(list(grouped_by_date.keys()))[:4]
+    sorted_dates = sorted([d for d in grouped_by_date.keys() if d != "unknown"])[:4]
 
-    images = []
-    # Download thumbnails ONLY for the 4 dates we kept
+    # ── Per-date tile selection: consistent MGRS tile across all dates ─────────
+    # Problem: picking lowest-cloud tile independently per date causes different
+    # MGRS tiles to win on different dates → alternating geographic extents.
+    # Solution (pure selection, no geometry math):
+    #   1. Pick the best (lowest-cloud) tiles for the FIRST date (up to 2).
+    #   2. Record their MGRS codes (e.g. ["T42RVN", "T42RVP"]).
+    #   3. For every subsequent date, prefer tiles with those exact MGRS codes.
+    #   4. Fall back to lowest-cloud selection only if those anchors are unavailable.
+
+    def _best_tiles(tile_list, count=2):
+        """Top 'count' clearest UNIQUE tiles, with deterministic tie-breaking."""
+        if not tile_list:
+            return []
+        
+        # Group by anchor (mgrs/orbit) and keep the clearest image for each
+        best_per_anchor = {}
+        for img, mgrs, cc in tile_list:
+            if mgrs not in best_per_anchor or cc < best_per_anchor[mgrs][1]:
+                best_per_anchor[mgrs] = (img, cc)
+        
+        # Sort unique anchors: primary by cloud cover, secondary by MGRS code for stability
+        sorted_anchors = sorted(
+            best_per_anchor.items(), 
+            key=lambda x: (x[1][1], x[0]) 
+        )
+        return [val[0] for key, val in sorted_anchors[:count]]
+
+    def _consistent_tiles(tile_list, preferred_anchors, count=2):
+        """Return unique tiles matching preferred_anchors, filling up with best uniques if needed."""
+        selected = []
+        anchors_seen = set()
+        
+        # 1. Priority: Exact matches for preferred anchors (one image per anchor)
+        if preferred_anchors:
+            # Sort tile_list by CC (index 2) first
+            sorted_candidates = sorted(tile_list, key=lambda t: t[2])
+            
+            for img, mgrs, cc in sorted_candidates:
+                if mgrs in preferred_anchors and mgrs not in anchors_seen:
+                    selected.append(img)
+                    anchors_seen.add(mgrs)
+        
+        # 2. Fill: Best remaining unique tiles if we are below count
+        if len(selected) < count:
+            remaining = [t for t in tile_list if t[1] not in anchors_seen]
+            best_uniques = _best_tiles(remaining, count - len(selected))
+            for img in best_uniques:
+                selected.append(img)
+            
+        return selected[:count]
+
+    # Use locked_anchors if provided, else perform 'Master Anchor Bootstrapping' 
+    # across the entire sequence to find the most stable dual-tile frame.
+    preferred_anchors = locked_anchors
+    if not preferred_anchors:
+        # Identify anchors present on the FIRST date (crucial for initial framing)
+        first_date_anchors = set(m for img, m, cc in grouped_by_date[sorted_dates[0]])
+        
+        anchor_stats = {} # mgrs -> {on_first_date, total_count, best_cc}
+        for d in sorted_dates:
+            for img, mgrs, cc in grouped_by_date[d]:
+                if mgrs not in anchor_stats:
+                    anchor_stats[mgrs] = {
+                        "first": 1 if mgrs in first_date_anchors else 0,
+                        "count": 0,
+                        "best_cc": 100.0
+                    }
+                anchor_stats[mgrs]["count"] += 1
+                if cc < anchor_stats[mgrs]["best_cc"]:
+                    anchor_stats[mgrs]["best_cc"] = cc
+        
+        # Select Master Anchors by priority: Date 1 presence > Count > CC > ID
+        sorted_masters = sorted(
+            [m for m in anchor_stats.keys() if m], # Skip empty strings
+            key=lambda m: (
+                -anchor_stats[m]["first"], 
+                -anchor_stats[m]["count"], 
+                anchor_stats[m]["best_cc"],
+                m
+            )
+        )
+        preferred_anchors = sorted_masters[:2]
+
+    selected_images_by_date = {}
     for d in sorted_dates:
-        for image in grouped_by_date[d]:
+        selected_images_by_date[d] = _consistent_tiles(grouped_by_date[d], preferred_anchors, count=2)
+
+    collection_path = "COPERNICUS/S2_HARMONIZED" if used_sensor == "Sentinel-2" else "COPERNICUS/S1_GRD"
+    images = []
+    # Download thumbnails for selected tiles (bounded to 2 per date)
+    for d in sorted_dates:
+        for image in selected_images_by_date[d]:
             bare_id = image.id().getInfo()
             asset_id = f"{collection_path}/{bare_id}" if bare_id and not bare_id.startswith("COPERNICUS/") else bare_id
 
@@ -288,18 +406,28 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
                     'crs': 'EPSG:3857',
                 })
             else:
-                thumbnail_url = _render_thumbnail(image.clip(aoi), used_sensor, asset_id, region=roi)
+                # SAR Rendering: use the same 512px/EPSG:3857 logic as Optical
+                # We remove .clip(aoi) here because the 'region' parameter handles the crop.
+                thumbnail_url = _render_thumbnail(image, used_sensor, asset_id, region=image.geometry())
 
             _validate_thumb_url(thumbnail_url, asset_id)
 
             # CRITICAL: Capturing pixels immediately prevents 401 token expiry.
-            import requests as _req, base64 as _b64
+            import requests as _req, base64 as _b64, time as _time, random as _random
             try:
-                _r = _req.get(thumbnail_url, timeout=30)
-                _r.raise_for_status()
-                thumbnail_url = "data:image/png;base64," + _b64.b64encode(_r.content).decode("utf-8")
+                # Robust retry loop for GEE thumbnail fetching
+                max_retries = 8
+                for attempt in range(max_retries):
+                    try:
+                        _r = _req.get(thumbnail_url, timeout=30)
+                        _r.raise_for_status()
+                        thumbnail_url = "data:image/png;base64," + _b64.b64encode(_r.content).decode("utf-8")
+                        break # Success
+                    except Exception as e:
+                        if attempt == max_retries - 1: raise e
+                        _time.sleep(1 + _random.uniform(0.5, 2.5)) # Randomized jittered delay
             except Exception:
-                pass # Fallback to raw URL if download fails
+                pass  # Fallback to raw URL if download fails after retries
 
             metadata = _extract_image_metadata(image, used_sensor, region=region_for_thumb)
             images.append({
@@ -308,7 +436,14 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str):
                 "metadata": metadata,
             })
 
-    return {"status": "success", "data": {"images": images, "resolved_aoi": aoi_dict}}
+    return {
+        "status": "success", 
+        "data": {
+            "images": images, 
+            "resolved_aoi": aoi_dict,
+            "anchors_used": preferred_anchors
+        }
+    }
 
 
 def _compute_index(img: ee.Image, sensor: str, index_type: str):
@@ -322,11 +457,12 @@ def _compute_index(img: ee.Image, sensor: str, index_type: str):
     if is_sar:
         # SAR change proxy: log-ratio of VV backscatter (dB scale)
         vv = img.select("VV")
-        vh = img.select("VH") if index_type == "Log-Ratio" else None
-        if index_type == "Log-Ratio" and vh is not None:
-            index_img = vv.subtract(vh).rename("Log-Ratio")
+        if index_type == "Log-Ratio":
+            # For SAR water detection, we use VV as a proxy for the 'Log' of backscatter.
+            # (In S1_GRD, VV is already in dB, which is a logarithmic scale).
+            index_img = vv.rename("Log-Ratio")
         else:
-            # Default SAR: use VV directly as a single-band proxy
+            # Default SAR: use VV directly
             index_img = vv.rename(index_type)
     else:
         # Optical (Sentinel-2) band routing
@@ -449,15 +585,28 @@ def compute_mask_gee(
             _validate_thumb_url(mask_url, f"mask for asset {asset_id}")
 
             # ROBUST BASE64 CAPTURE
-            import requests as _req, base64 as _b64, sys as _sys
+            import requests as _req, base64 as _b64, sys as _sys, time as _time, random as _random
             try:
-                _r = _req.get(mask_url, timeout=30)
-                if _r.status_code == 200:
-                    mask_url = "data:image/png;base64," + _b64.b64encode(_r.content).decode("utf-8")
-                else:
-                    print(f"BACKEND ERROR: GEE returned {_r.status_code} for mask URL", file=_sys.stderr)
-            except Exception as _e:
-                print(f"BACKEND EXCEPTION: Failed to encode mask: {_e}", file=_sys.stderr)
+                # Robust retry loop for GEE thumbnail fetching
+                max_retries = 8
+                encoded_successfully = False
+                for attempt in range(max_retries):
+                    try:
+                        _r = _req.get(mask_url, timeout=30)
+                        if _r.status_code == 200:
+                            mask_url = "data:image/png;base64," + _b64.b64encode(_r.content).decode("utf-8")
+                            encoded_successfully = True
+                            break
+                        else:
+                            if attempt == max_retries - 1:
+                                print(f"BACKEND ERROR: GEE returned {_r.status_code} for mask URL after {max_retries} attempts", file=_sys.stderr)
+                            _time.sleep(1 + _random.uniform(0.5, 2.5))
+                    except Exception as _e:
+                        if attempt == max_retries - 1:
+                            print(f"BACKEND EXCEPTION: Failed to encode mask: {_e}", file=_sys.stderr)
+                        _time.sleep(1 + _random.uniform(0.5, 2.5))
+            except Exception:
+                pass # Fallback to URL
 
             # --- Cloud cover (optical only) ---
             if not is_sar:
