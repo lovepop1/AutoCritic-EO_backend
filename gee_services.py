@@ -255,44 +255,78 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str, locked_ancho
 
     # --- Batch Metadata Fetch (Crucial to avoid 401 timeouts) ---
     # We fetch all indices and cloud cover metrics in ONE server-side call.
+    # IMPORTANT: Sentinel-1 (SAR) does NOT have CLOUDY_PIXEL_PERCENTAGE.
     try:
-        # We need system:index (for MGRS/Orbit) and CLOUDY_PIXEL_PERCENTAGE
+        if used_sensor == "Sentinel-2":
+            selectors = ['system:index', 'CLOUDY_PIXEL_PERCENTAGE']
+            repeat_count = 2
+        else:
+            # For SAR, we use (relativeOrbitNumber_start + orbitProperties_pass) 
+            # to group imagery by viewing geometry.
+            selectors = ['system:index', 'relativeOrbitNumber_start', 'orbitProperties_pass']
+            repeat_count = 3
+            
         raw_metadata = collection.reduceColumns(
-            reducer=ee.Reducer.toList().repeat(2),
-            selectors=['system:index', 'CLOUDY_PIXEL_PERCENTAGE']
-        ).getInfo().get('list', [[], []])
-        # raw_metadata is [[idx1, idx2...], [cc1, cc2...]]
+            reducer=ee.Reducer.toList().repeat(repeat_count),
+            selectors=selectors
+        ).getInfo().get('list', [[], [], []])
+        
+        # Guard against Earth Engine returning ['list': []] instead of [[], []]
+        if not isinstance(raw_metadata, list) or len(raw_metadata) < 2:
+            raw_metadata = [[], []]
     except Exception as e:
-        logger.error(f"[gee_services] Metadata batch fetch failed: {e}")
+        logger.error(f"[gee_services] Metadata batch fetch failed for {used_sensor}: {e}")
         raw_metadata = [[], []]
 
     from collections import defaultdict
     grouped_by_date = defaultdict(list)   # stores (ee.Image, mgrs_code, cloud_cover) tuples
     
     system_indices = raw_metadata[0]
-    cloud_covers = raw_metadata[1]
+    anchor_values = raw_metadata[1] # For S2: CC %; For S1: Relative Orbit Number
+    orbit_passes = raw_metadata[2] if len(raw_metadata) > 2 else [] # For S1: ASCENDING/DESCENDING
 
     for i in range(count):
+        # We fetch the image and its basic properties
         image = ee.Image(image_list.get(i))
         
-        # Extract MGRS/Orbit code from pre-fetched system:index
+        # 1. MGRS/Orbit Code (The Spatial Anchor)
         sys_idx = system_indices[i] if i < len(system_indices) else ""
-        mgrs = sys_idx.split('_')[-1] if '_' in sys_idx else ""
+        if used_sensor == "Sentinel-2":
+            mgrs = sys_idx.split('_')[-1] if '_' in sys_idx else ""
+        else:
+            # For SAR, use (Relative Orbit + Pass Direction) as the anchor
+            orbit = str(anchor_values[i]) if i < len(anchor_values) else ""
+            direction = str(orbit_passes[i]) if i < len(orbit_passes) else ""
+            mgrs = f"{orbit}_{direction}"
         
-        # Extract Cloud Cover from pre-fetched list
-        cc = float(cloud_covers[i]) if (i < len(cloud_covers) and cloud_covers[i] is not None) else 100.0
-        
-        # Get timestamp (we still need this info, but it's usually stable)
-        # To be ultra-safe, we could have batched this too, but 1-2 getInfos for dates is okay.
-        # Actually, let's just parse it from sys_idx if possible for speed.
-        # S2 index format: 20220826T055639_...
+        # 2. Cloud Cover / Quality Metric
+        if used_sensor == "Sentinel-2":
+            cc = float(anchor_values[i]) if (i < len(anchor_values) and anchor_values[i] is not None) else 100.0
+        else:
+            cc = 0.0 # SAR is cloud-penetrating
+            
+        # 3. Timestamp (Use pre-fetched list value if available, else getInfo fallback)
         try:
-            date_part = sys_idx.split('_')[0].split('T')[0]
-            date_str = datetime.strptime(date_part, '%Y%m%d').strftime('%Y-%m-%d')
+            # S2 index format: 20220826T055639_...
+            # S1 index format: S1A_IW_GRDH_1SDV_20220412T...
+            date_part = ""
+            if sys_idx:
+                parts = sys_idx.split('_')
+                for p in parts:
+                    if len(p) >= 8 and p[:8].isdigit() and 'T' in p:
+                        date_part = p[:8]
+                        break
+            
+            if date_part:
+                date_str = datetime.strptime(date_part, '%Y%m%d').strftime('%Y-%m-%d')
+            else:
+                ts_ms = image.get('system:time_start').getInfo()
+                date_str = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d') if ts_ms else "unknown"
         except:
             date_str = "unknown"
 
-        grouped_by_date[date_str].append((image, mgrs, cc))
+        # We store sys_idx for deterministic tie-breaking in tile selection
+        grouped_by_date[date_str].append((image, mgrs, cc, sys_idx))
 
     # Keep only the first 4 dates
     sorted_dates = sorted([d for d in grouped_by_date.keys() if d != "unknown"])[:4]
@@ -311,11 +345,17 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str, locked_ancho
         if not tile_list:
             return []
         
+    def _best_tiles(tile_list, count=2):
+        """Return the top unique tiles by cloud cover / stability."""
+        if not tile_list:
+            return []
+        
         # Group by anchor (mgrs/orbit) and keep the clearest image for each
         best_per_anchor = {}
-        for img, mgrs, cc in tile_list:
-            if mgrs not in best_per_anchor or cc < best_per_anchor[mgrs][1]:
-                best_per_anchor[mgrs] = (img, cc)
+        for img, mgrs, cc, sys_idx in tile_list:
+            # For SAR (cc=0), use sys_idx as a deterministic tie-breaker for slice selection
+            if mgrs not in best_per_anchor or cc < best_per_anchor[mgrs][1] or (cc == best_per_anchor[mgrs][1] and sys_idx < best_per_anchor[mgrs][2]):
+                best_per_anchor[mgrs] = (img, cc, sys_idx)
         
         # Sort unique anchors: primary by cloud cover, secondary by MGRS code for stability
         sorted_anchors = sorted(
@@ -331,10 +371,10 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str, locked_ancho
         
         # 1. Priority: Exact matches for preferred anchors (one image per anchor)
         if preferred_anchors:
-            # Sort tile_list by CC (index 2) first
-            sorted_candidates = sorted(tile_list, key=lambda t: t[2])
+            # Sort tile_list by CC (index 2) first, then sys_idx (index 3) for deterministic SAR slice selection
+            sorted_candidates = sorted(tile_list, key=lambda t: (t[2], t[3]))
             
-            for img, mgrs, cc in sorted_candidates:
+            for img, mgrs, cc, sys_idx in sorted_candidates:
                 if mgrs in preferred_anchors and mgrs not in anchors_seen:
                     selected.append(img)
                     anchors_seen.add(mgrs)
@@ -353,11 +393,11 @@ def load_imagery_gee(aoi_dict: dict, date_range: list, sensor: str, locked_ancho
     preferred_anchors = locked_anchors
     if not preferred_anchors:
         # Identify anchors present on the FIRST date (crucial for initial framing)
-        first_date_anchors = set(m for img, m, cc in grouped_by_date[sorted_dates[0]])
+        first_date_anchors = set(m for img, m, cc, _ in grouped_by_date[sorted_dates[0]])
         
         anchor_stats = {} # mgrs -> {on_first_date, total_count, best_cc}
         for d in sorted_dates:
-            for img, mgrs, cc in grouped_by_date[d]:
+            for img, mgrs, cc, _ in grouped_by_date[d]:
                 if mgrs not in anchor_stats:
                     anchor_stats[mgrs] = {
                         "first": 1 if mgrs in first_date_anchors else 0,
